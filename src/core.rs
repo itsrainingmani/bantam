@@ -2,7 +2,11 @@ use std::{collections::HashMap, fmt::Display, rc::Rc};
 
 use crate::{
     expression::Expression,
-    parselet::{InfixParselet, PrefixParselet},
+    parselet::{
+        AssignParselet, BinaryOperatorParselet, CallParselet, ConditionalParselet, GroupParselet,
+        InfixParselet, NameParselet, PostfixOperatorParselet, PrefixOperatorParselet,
+        PrefixParselet,
+    },
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -117,7 +121,9 @@ impl Display for Token {
 // determine how a series of infix expressions will be grouped. For example,
 // "a + b * c - d" will be parsed as "(a + (b * c)) - d" because "*" has higher
 // precedence than "+" and "-". Here, bigger numbers mean higher precedence.
+#[derive(PartialEq, PartialOrd, Clone, Debug, Copy)]
 pub enum Precedence {
+    Everything = 0,
     Assignment = 1,
     Conditional = 2,
     Sum = 3,
@@ -128,12 +134,30 @@ pub enum Precedence {
     Call = 8,
 }
 
+impl From<usize> for Precedence {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => Self::Everything,
+            1 => Self::Assignment,
+            2 => Self::Conditional,
+            3 => Self::Sum,
+            4 => Self::Product,
+            5 => Self::Exponent,
+            6 => Self::Prefix,
+            7 => Self::Postfix,
+            8 => Self::Call,
+            _ => panic!("Invalid precedence value"),
+        }
+    }
+}
+
 // A very primitive lexer. Takes a string and splits it into a series of
 // Tokens. Operators and punctuation are mapped to unique keywords. Names,
 // which can be any series of letters, are turned into NAME tokens. All other
 // characters are ignored (except to separate names). Numbers and strings are
 // not supported. This is really just the bare minimum to give the parser
 // something to work with.
+#[derive(Debug, Clone)]
 pub struct Lexer {
     index: usize,
     text: Vec<char>,
@@ -204,6 +228,8 @@ impl Iterator for Lexer {
 pub struct Parser {
     tokens: Box<dyn Iterator<Item = Token>>,
     read: Vec<Token>,
+
+    // We have separate tables for prefix and infix expressions because sometimes we have both a prefix and infix parselet for the same TokenType. For example, the prefix parselet for `(` handles grouping in an expression like `a * (b + c)`. Meanwhile the infix parselet for `(` handles function calls like `a(b)`
     prefix_parselets: HashMap<TokenType, Rc<dyn PrefixParselet>>,
     infix_parselets: HashMap<TokenType, Rc<dyn InfixParselet>>,
 }
@@ -226,8 +252,9 @@ impl Parser {
         self.infix_parselets.insert(tt, Rc::from(parselet));
     }
 
-    pub fn parse_expression_precedence(&mut self, precedence: usize) -> Box<dyn Expression> {
+    pub fn parse_expression_precedence(&mut self, precedence: Precedence) -> Box<dyn Expression> {
         let mut token: Token = self.consume();
+        println!("{}", token);
         let prefix = self
             .prefix_parselets
             .get(token.get_type())
@@ -236,6 +263,7 @@ impl Parser {
 
         let mut left = prefix.parse(self, token);
 
+        // if parse_expression() encounters an expression whose precedence is lower than we allow, it stops parsing and returns what it has so far
         while precedence < self.get_precedence() {
             token = self.consume();
             let infix = self.infix_parselets.get(token.get_type()).unwrap().clone();
@@ -246,18 +274,19 @@ impl Parser {
     }
 
     pub fn parse_expression(&mut self) -> Box<dyn Expression> {
-        self.parse_expression_precedence(0)
+        self.parse_expression_precedence(Precedence::Everything)
     }
 
     // Since match is a keyword
     pub fn match_tok(&mut self, expected: TokenType) -> bool {
         let token = self.look_ahead(0);
-        if token.get_type() != &expected {
-            panic!("Expected token and found");
+        if *token.get_type() != expected {
+            // panic!("Expected {} and found {}", expected, token.get_type());
+            false
+        } else {
+            self.consume();
+            true
         }
-
-        self.consume();
-        true
     }
 
     pub fn consume_expected(&mut self, expected: TokenType) -> Token {
@@ -271,7 +300,6 @@ impl Parser {
 
     pub fn consume(&mut self) -> Token {
         self.look_ahead(0);
-
         self.read.remove(0)
     }
 
@@ -283,12 +311,13 @@ impl Parser {
         return self.read[distance].clone();
     }
 
-    fn get_precedence(&mut self) -> usize {
+    // Helper function to get the precedence of the current token or a default value if there's no infix parselet for the token
+    fn get_precedence(&mut self) -> Precedence {
         let tok_type: TokenType = *self.look_ahead(0).get_type();
         if let Some(infix_parser) = self.infix_parselets.get(&tok_type) {
             infix_parser.get_precedence()
         } else {
-            0
+            Precedence::Everything
         }
     }
 }
@@ -303,23 +332,60 @@ impl BantamParser {
             parser: Parser::new(tokens),
         };
 
+        // Register tokens that need special parselets
+        bp.register_prefix(TokenType::Name, Box::new(NameParselet::new()));
+        bp.register_infix(TokenType::Assign, Box::new(AssignParselet::new()));
+        bp.register_infix(TokenType::Question, Box::new(ConditionalParselet::new()));
+        bp.register_prefix(TokenType::LeftParen, Box::new(GroupParselet::new()));
+        bp.register_infix(TokenType::LeftParen, Box::new(CallParselet::new()));
+
+        // Register the simple operator parselets
+        bp.prefix(TokenType::Plus, Precedence::Prefix);
+        bp.prefix(TokenType::Minus, Precedence::Prefix);
+        bp.prefix(TokenType::Tilde, Precedence::Prefix);
+        bp.prefix(TokenType::Bang, Precedence::Prefix);
+
+        // For kicks, we'll make "!" both prefix and postfix, kinda like ++
+        bp.postfix(TokenType::Bang, Precedence::Postfix);
+
+        bp.infix_left(TokenType::Plus, Precedence::Sum);
+        bp.infix_left(TokenType::Minus, Precedence::Sum);
+        bp.infix_left(TokenType::Asterisk, Precedence::Product);
+        bp.infix_left(TokenType::Slash, Precedence::Product);
+        bp.infix_right(TokenType::Caret, Precedence::Exponent);
+
         bp
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::{Lexer, TokenType};
+    pub fn register_prefix(&mut self, tt: TokenType, parselet: Box<dyn PrefixParselet>) -> () {
+        self.parser.register_prefix(tt, parselet);
+    }
 
-    #[test]
-    fn test_lexer() {
-        let mut lexer = Lexer::new(String::from("from + offset(time)"));
+    pub fn register_infix(&mut self, tt: TokenType, parselet: Box<dyn InfixParselet>) -> () {
+        self.parser.register_infix(tt, parselet);
+    }
 
-        while let Some(tok) = lexer.next() {
-            if *tok.get_type() == TokenType::EOF {
-                break;
-            }
-            println!("{}", tok);
-        }
+    /// Register a prefix unary operator parselet for the given token and precedence
+    pub fn prefix(&mut self, tt: TokenType, precedence: Precedence) -> () {
+        self.register_prefix(tt, Box::new(PrefixOperatorParselet::new(precedence)));
+    }
+
+    /// Register a postfix unary operator parselet for the given token and precedence
+    pub fn postfix(&mut self, tt: TokenType, precedence: Precedence) -> () {
+        self.register_infix(tt, Box::new(PostfixOperatorParselet::new(precedence)));
+    }
+
+    /// Register a left-associative binary operator parselet for the given token and precedence
+    pub fn infix_left(&mut self, tt: TokenType, precedence: Precedence) -> () {
+        self.register_infix(tt, Box::new(BinaryOperatorParselet::new(precedence, false)));
+    }
+
+    /// Register a right-associative binary operator parselet for the given token and precedence
+    pub fn infix_right(&mut self, tt: TokenType, precedence: Precedence) -> () {
+        self.register_infix(tt, Box::new(BinaryOperatorParselet::new(precedence, true)));
+    }
+
+    pub fn parse_expression(&mut self) -> Box<dyn Expression> {
+        self.parser.parse_expression()
     }
 }
